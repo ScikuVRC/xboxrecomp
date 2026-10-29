@@ -1323,8 +1323,14 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             else if (t - s_masked_since > 2000 && told < 5) {
                 told++;
                 s_masked_since = t;
+                /* A DPC runs only while the one-CPU gate is free: name who holds it,
+                 * so a stall says which thread to look at (scripts/guest-stack.py). */
+                extern unsigned long xbox_DispatchGateOwner(void);
+                extern int xbox_DpcPending(void);
                 fprintf(stderr, "  [OHCI0] interrupts masked for 2 s: the USB deferred routine has not"
-                                " run; the pad is not being polled (#%d)\n", told);
+                                " run; the pad is not being polled (#%d; dispatch gate held by thread %lu,"
+                                " DPC %s)\n", told, xbox_DispatchGateOwner(),
+                        xbox_DpcPending() ? "queued" : "not queued");
                 fflush(stderr);
             }
             bus_unlock(); continue;

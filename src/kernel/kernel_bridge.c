@@ -4336,8 +4336,31 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
     (void)unused;
     /* It runs interrupt and deferred routines, which on the console preempt
-     * the title on its one CPU rather than running beside it. */
+     * the title on its one CPU rather than running beside it: the guest core
+     * is its ideal processor, where at TIME_CRITICAL it preempts the title.
+     * Not its only one. Pinned there, in about one start in fifteen it was not
+     * scheduled for 3.1 s while something above every thread priority held
+     * that core early in start-up (a 1 ms wait returned 3,125 ms later); the
+     * USB host controller's first deferred routine waited with it, the
+     * driver gave up on the pad and the title sat at "press start" for good.
+     * When the guest core is unavailable to it, the title's own threads, which
+     * are pinned there, cannot run either, so it still does not run beside
+     * them in practice. RECOMP_TIMER_PIN=1 pins it as before. */
+#if defined(_WIN32)
+    {
+        DWORD_PTR guest = xbox_GuestCpuMask();
+        if (guest && !getenv("RECOMP_TIMER_PIN")) {
+            DWORD core = 0;
+            while (!((guest >> core) & 1))
+                core++;
+            SetThreadIdealProcessor(GetCurrentThread(), core);
+        } else {
+            xbox_PinToGuestCore();
+        }
+    }
+#else
     xbox_PinToGuestCore();
+#endif
     /* Preempt, not share: a title thread spinning at raised priority on the
      * one guest CPU -- Direct3D waiting for a fence -- otherwise starves the
      * very DPC whose acknowledgement lets the GPU reach that fence. It sleeps
@@ -4383,6 +4406,20 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             int ran;
 
             WaitForSingleObject(g_timer_wake, 1);
+            {
+                /* A pass long after the last means this thread was not run,
+                 * and DPCs waited with it (the start-up stall above showed as
+                 * a 3,125 ms gap). */
+                static ULONGLONG last_pass;
+                static int told;
+                ULONGLONG t = GetTickCount64();
+                if (last_pass && t - last_pass > 500 && told++ < 10) {
+                    fprintf(stderr, "  [TIMER] %llu ms since the last pass\n",
+                            (unsigned long long)(t - last_pass));
+                    fflush(stderr);
+                }
+                last_pass = t;
+            }
             kernel_vblank_tick();  /* the GPU's frame clock latches */
             kernel_ptimer_tick();  /* and its programmable alarm */
             /* Present software methods one at a time and deliver while the
