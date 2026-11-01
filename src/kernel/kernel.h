@@ -568,6 +568,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
  * device rule matches reach it: partition images and unrecognised paths
  * do not. */
 extern void (*g_xbox_path_hook)(const char *xbox_path);
+/* Optional: a project sets this to put files of its own in place of the game
+ * dir's (mods). Called for paths under the game dir only, with the part below
+ * it (backslashes, as the title wrote it); returns TRUE when it wrote the host
+ * path of a replacement into `host_path`. NULL by default. */
+extern BOOL (*g_xbox_game_file_hook)(const char *relative, xbox_host_char *host_path, DWORD size);
 /* Tell the script-anchor clocks a path was opened (kernel_script_anchor.c). */
 void xbox_AnchorNoteOpen(const char *xbox_path);
 
