@@ -568,11 +568,15 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
  * device rule matches reach it: partition images and unrecognised paths
  * do not. */
 extern void (*g_xbox_path_hook)(const char *xbox_path);
-/* Optional: a project sets this to put files of its own in place of the game
- * dir's (mods). Called for paths under the game dir only, with the part below
- * it (backslashes, as the title wrote it); returns TRUE when it wrote the host
- * path of a replacement into `host_path`. NULL by default. */
-extern BOOL (*g_xbox_game_file_hook)(const char *relative, xbox_host_char *host_path, DWORD size);
+/* Optional: a project sets this to serve a file of the game volume from
+ * somewhere else, such as a mod's rebuilt copy of an archive. `relative` is the
+ * part of the guest path below the game root, as the title wrote it (either
+ * separator, any case). Return TRUE after writing a complete host path to
+ * host_path (size characters) to open that file instead; FALSE keeps the normal
+ * translation. Called on the calling guest thread for every path that lands in
+ * the game folder; save-area paths never reach it.
+ * NULL by default. */
+extern BOOL (*g_xbox_game_file_redirect)(const char *relative, xbox_host_char *host_path, DWORD size);
 /* Tell the script-anchor clocks a path was opened (kernel_script_anchor.c). */
 void xbox_AnchorNoteOpen(const char *xbox_path);
 
@@ -922,6 +926,10 @@ int     xbox_DispatchGateOn(void);
 int     xbox_DispatchGateTryEnter(void);       /* the one-CPU gate: ISR delivery */
 void    xbox_DispatchGateEnter(void);
 void    xbox_DispatchGateLeave(void);
+/* Optional work: try the active dispatch exclusion without waiting, changing
+ * IRQL, or draining DPCs. A successful try must be paired with Leave. */
+int     xbox_DispatchExclusionTryEnter(void);
+void    xbox_DispatchExclusionLeave(void);
 void    xbox_IrqlLeaveInterrupt(int saved);
 /* This thread is at DISPATCH_LEVEL or above, or holds the one-CPU gate. */
 int     xbox_IrqlThisThreadBlocksDpcs(void);

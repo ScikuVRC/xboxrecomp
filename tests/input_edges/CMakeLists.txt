@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(input_edges_test C)
+add_executable(input_edges_test test_main.c ../../src/input/input_edges.c)
+target_include_directories(input_edges_test PRIVATE ../../src/input)
+enable_testing()
+foreach(case rapid chord commit age overflow reset analog threshold wrap ring)
+    add_test(NAME input_edges_${case} COMMAND input_edges_test ${case})
+endforeach()

@@ -19,8 +19,21 @@
 #endif
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "input_host.h"
+#include "input_trace.h"
+#include "input_edges.h"
+#include "../platform/host_time.h"
+
+static XboxInputTraceSink g_input_trace;
+void xbox_InputTraceSetSink(XboxInputTraceSink sink) { g_input_trace = sink; }
+int xbox_InputTraceActive(void) { return g_input_trace != NULL; }
+void xbox_InputTraceEmit(const char *stage, int slot, const void *data,
+                         unsigned bytes, uint64_t aux0, uint64_t aux1)
+{
+    if (g_input_trace) g_input_trace(stage, slot, data, bytes, aux0, aux1);
+}
 
 #ifdef XBOXRECOMP_HAVE_SDL3
 #include <SDL3/SDL.h>
@@ -29,6 +42,7 @@
 #define SLOTS         4
 #define MAX_DEVICES   8
 #define POLL_MS       2
+static int input_poll_ms = POLL_MS;
 #define RUMBLE_REFRESH_MS 100
 #define RUMBLE_HOLD_MS    300
 #define CONNECT_BUZZ_MS   250
@@ -74,12 +88,22 @@ static struct Host {
     Slot slot[SLOTS];
     XBOX_GAMEPAD out[SLOTS];
     XBOX_GAMEPAD last[SLOTS];
+    XBOX_GAMEPAD reported[SLOTS];
+    InputEdges edges[SLOTS];
     InputRaw raw[SLOTS];            /* the pads as read, for a host menu */
     volatile LONG ui_active;
     DWORD packet[SLOTS];
+    unsigned input_epoch;
     int found;                      /* pads opened at start */
     int sdl;                        /* SDL is the pad backend */
 } H;
+static int g_consumed_edges;
+static unsigned g_edge_threshold;
+void xbox_HostInputEnableConsumedEdges(int enabled) { g_consumed_edges = enabled != 0; }
+void xbox_HostInputSetEdgeThreshold(unsigned threshold) { g_edge_threshold = threshold > 255u ? 255u : threshold; }
+int xbox_HostInputConsumedEdges(void) { return g_consumed_edges && H.running; }
+static InputRaw trace_raw[SLOTS];
+static int trace_raw_seen[SLOTS], trace_mapped_seen[SLOTS];
 
 void xbox_HostInputDefaults(InputHostConfig *cfg)
 {
@@ -218,6 +242,10 @@ static void attach_virtual_pads(int n)
         desc.Rumble = virtual_rumble;
         g_virtual_ids[i] = SDL_AttachVirtualJoystick(&desc);
         g_virtual_joys[i] = g_virtual_ids[i] ? SDL_OpenJoystick(g_virtual_ids[i]) : NULL;
+        if (g_virtual_joys[i]) {
+            SDL_SetJoystickVirtualAxis(g_virtual_joys[i], SDL_GAMEPAD_AXIS_LEFT_TRIGGER, -32768);
+            SDL_SetJoystickVirtualAxis(g_virtual_joys[i], SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, -32768);
+        }
         if (g_virtual_ids[i]) g_virtual_count++;
     }
 }
@@ -255,7 +283,9 @@ static void assign_device(int d)
         if (s == H.kb_slot || H.slot[s].device >= 0) continue;
         H.slot[s].device = d;
         H.dev[d].slot = s;
+        trace_raw_seen[s] = trace_mapped_seen[s] = 0;
         log_line("[INPUT] %s is player %d\n", H.dev[d].name, s + 1);
+        xbox_InputTraceEmit("device_add", s, H.dev[d].name, (unsigned)strlen(H.dev[d].name), H.dev[d].backend, d);
         if (g_need_players) g_need_players(s + 1);
         if (H.cfg.rumble_on_connect && !H.dev[d].is_virtual)
             H.slot[s].buzz_until = GetTickCount64() + CONNECT_BUZZ_MS;
@@ -283,7 +313,14 @@ static void free_device(int d)
 {
     if (H.dev[d].slot >= 0) {
         log_line("[INPUT] %s removed from player %d\n", H.dev[d].name, H.dev[d].slot + 1);
+        xbox_InputTraceEmit("device_remove", H.dev[d].slot, NULL, 0, H.dev[d].backend, d);
         H.slot[H.dev[d].slot].device = -1;
+        if (g_consumed_edges) {
+            static const unsigned char neutral[10] = {0};
+            int slot = H.dev[d].slot;
+            input_edges_reset(&H.edges[slot], neutral);
+            memset(&H.out[slot], 0, sizeof H.out[slot]);
+        }
     }
 #ifdef XBOXRECOMP_HAVE_SDL3
     if (H.dev[d].gp) SDL_CloseGamepad(H.dev[d].gp);
@@ -483,9 +520,11 @@ static void poll_once(void)
     int focused = InterlockedCompareExchange(&H.focused, 0, 0);
     int ui = InterlockedCompareExchange(&H.ui_active, 0, 0);
     int s, live;
+    unsigned epoch;
 
     EnterCriticalSection(&H.cs);
     cfg = H.cfg;
+    epoch = H.input_epoch;
     memcpy(keys, H.key, sizeof(keys));
     for (s = 0; s < INPUT_CONTROL_COUNT; s++)
         if (H.script_held[s] && cfg.keys.count[s]) keys[cfg.keys.key[s][0]] = 1;
@@ -497,7 +536,7 @@ static void poll_once(void)
     memset(next, 0, sizeof(next));
     memset(raws, 0, sizeof(raws));
     for (s = 0; s < SLOTS; s++) {
-        InputRaw raw;
+        InputRaw raw = {0};
         Device *dv;
         int have = 0;
         if (H.slot[s].device < 0) continue;
@@ -508,6 +547,12 @@ static void poll_once(void)
 #if defined(_WIN32)
         if (dv->backend == 2) have = read_xinput(dv->xi_index, &raw);
 #endif
+        if (have && xbox_InputTraceActive() && (!trace_raw_seen[s] || memcmp(&raw, &trace_raw[s], sizeof raw))) {
+            trace_raw_seen[s] = 1;
+            trace_raw[s] = raw;
+            xbox_InputTraceEmit("host_raw", s, &raw, sizeof raw,
+                (uint64_t)dv->backend, (uint64_t)(focused | (ui << 1) | (live << 2)));
+        }
         if (have && live) {
             raws[s] = raw;
             if (!ui) xbox_InputMap_PadMap(&cfg.padmap, &raw, &next[s]);
@@ -523,12 +568,33 @@ static void poll_once(void)
     }
 
     EnterCriticalSection(&H.cs);
+    /* A focus/UI/config change may have happened while SDL was sampled.
+     * Never publish that older sample after cancellation. */
+    if (g_consumed_edges && (epoch != H.input_epoch ||
+        InterlockedCompareExchange(&H.ui_active,0,0) ||
+        (!InterlockedCompareExchange(&H.focused,0,0) && !H.cfg.ignore_focus))) {
+        memset(next,0,sizeof next);
+        live = 0;
+    }
     for (s = 0; s < SLOTS; s++) {
         if (memcmp(&next[s], &H.last[s], sizeof(XBOX_GAMEPAD)) != 0) {
             H.last[s] = next[s];
             H.packet[s]++;
         }
+        if (xbox_InputTraceActive() && (!trace_mapped_seen[s] || memcmp(&next[s], &H.out[s], sizeof next[s]))) {
+            trace_mapped_seen[s] = 1;
+            xbox_InputTraceEmit("host_mapped", s, &next[s], sizeof next[s], H.packet[s],
+                H.slot[s].device >= 0 ? (uint64_t)H.dev[H.slot[s].device].backend : 3);
+        }
         H.out[s] = next[s];
+        if (g_consumed_edges) {
+            InputEdges *q = &H.edges[s];
+            uint64_t losses = q->overflow + q->expired;
+            if (!live || ui) input_edges_reset(q, (const unsigned char *)&next[s]);
+            else input_edges_feed(q, (const unsigned char *)&next[s], xbox_HostNowNs());
+            if (q->overflow + q->expired != losses)
+                xbox_InputTraceEmit("input_edge_loss", s, NULL, 0, q->overflow, q->expired);
+        }
         H.raw[s] = raws[s];
     }
     LeaveCriticalSection(&H.cs);
@@ -572,7 +638,18 @@ static void hotplug_once(void)
 #if defined(_WIN32)
         SDL_Event e;
         SDL_UpdateGamepads();
-        while (SDL_PollEvent(&e)) {
+        if (xbox_InputTraceActive()) xbox_InputTraceEmit("sdl_clock", -1, NULL, 0, SDL_GetTicksNS(), 0);
+        /* UpdateGamepads and PeepEvents are thread-safe; PollEvent can invoke
+         * the main-thread-only video event pump. This worker owns only pads. */
+        while (SDL_PeepEvents(&e, 1, SDL_GETEVENT, SDL_EVENT_JOYSTICK_AXIS_MOTION,
+                              SDL_EVENT_GAMEPAD_STEAM_HANDLE_UPDATED) > 0) {
+            if (xbox_InputTraceActive() && (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || e.type == SDL_EVENT_GAMEPAD_BUTTON_UP)) {
+                int slot = -1;
+                uint8_t edge[2] = { e.gbutton.button, e.gbutton.down ? 1 : 0 };
+                for (d = 0; d < MAX_DEVICES; d++)
+                    if (H.dev[d].used && H.dev[d].backend == 1 && H.dev[d].id == e.gbutton.which) { slot = H.dev[d].slot; break; }
+                xbox_InputTraceEmit("sdl_button", slot, edge, sizeof edge, e.gbutton.timestamp, e.gbutton.which);
+            }
             if (e.type == SDL_EVENT_GAMEPAD_ADDED || e.type == SDL_EVENT_GAMEPAD_REMOVED) changed = 1;
             if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
                 if (!(H.cfg.no_pads && !is_virtual_id(e.gdevice.which)))
@@ -657,6 +734,29 @@ static void hotplug_once(void)
 #endif
 }
 
+/* Deadline scheduling avoids adding mapping/discovery time to every period.
+ * This timer is private to the reader, separate from the kernel timer wake. */
+static int wait_input_deadline(uint64_t deadline, HANDLE timer)
+{
+    uint64_t now = xbox_HostNowNs();
+    if (WaitForSingleObject(H.stop, 0) != WAIT_TIMEOUT) return 0;
+    if (now >= deadline) return 1;
+#if defined(_WIN32)
+    if (timer) {
+        LARGE_INTEGER due;
+        HANDLE waits[2] = { H.stop, timer };
+        due.QuadPart = -(LONGLONG)((deadline - now + 99u) / 100u);
+        if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+            return WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1;
+    }
+    return WaitForSingleObject(H.stop, (DWORD)((deadline - now + 999999u) / 1000000u)) == WAIT_TIMEOUT;
+#else
+    (void)timer;
+    xbox_HostSleepNs(deadline - now);
+    return WaitForSingleObject(H.stop, 0) == WAIT_TIMEOUT;
+#endif
+}
+
 static DWORD WINAPI reader_thread(LPVOID unused)
 {
     int d, i;
@@ -735,14 +835,23 @@ static DWORD WINAPI reader_thread(LPVOID unused)
             H.sdl ? "SDL" : "XInput",
             H.kb_slot >= 0 ? "its own player" : H.kb_merge ? "merged into player 1" : "off",
             H.players);
+    fprintf(stderr, "[INPUT] poll deadline %d ms; guest-consumed edges %s\n",
+            input_poll_ms, g_consumed_edges ? "on" : "off");
     if (H.kb_slot >= 0) fprintf(stderr, "[INPUT] keyboard and mouse are player %d\n", H.kb_slot + 1);
     fflush(stderr);
     SetEvent(H.ready);
 
     {
         ULONGLONG started = GetTickCount64();
+        uint64_t period = (uint64_t)input_poll_ms * 1000000u;
+        uint64_t deadline = xbox_HostNowNs() + period;
+        uint64_t cpu_checkpoint = 0;
+        HANDLE poll_timer = NULL;
         int late_done = 0;
-        while (WaitForSingleObject(H.stop, POLL_MS) == WAIT_TIMEOUT) {
+#if defined(_WIN32)
+        poll_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* high resolution */, TIMER_ALL_ACCESS);
+#endif
+        while (wait_input_deadline(deadline, poll_timer)) {
 #ifdef XBOXRECOMP_HAVE_SDL3
             /* Test hook: one more virtual pad arrives while the game runs. */
             if (H.sdl && H.cfg.virtual_late_ms && !late_done &&
@@ -766,9 +875,29 @@ static DWORD WINAPI reader_thread(LPVOID unused)
                 SDL_SetJoystickVirtualButton(g_virtual_joys[0], SDL_GAMEPAD_BUTTON_EAST, east);
             }
 #endif
+            xbox_InputTraceEmit("host_poll_begin", -1, NULL, 0, input_poll_ms, 0);
             hotplug_once();
             poll_once();
+            xbox_InputTraceEmit("host_poll_end", -1, NULL, 0, 0, 0);
+#if defined(_WIN32)
+            if (xbox_InputTraceActive() && xbox_HostNowNs() - cpu_checkpoint >= 1000000000ull) {
+                FILETIME created, exited, kernel, user;
+                if (GetThreadTimes(GetCurrentThread(),&created,&exited,&kernel,&user))
+                    xbox_InputTraceEmit("host_thread_cpu", -1, NULL, 0,
+                        ((uint64_t)kernel.dwHighDateTime << 32) | kernel.dwLowDateTime,
+                        ((uint64_t)user.dwHighDateTime << 32) | user.dwLowDateTime);
+                cpu_checkpoint = xbox_HostNowNs();
+            }
+#else
+            (void)cpu_checkpoint;
+#endif
+            deadline += period;
+            /* Skip missed deadlines instead of spinning through catch-up polls. */
+            if (deadline <= xbox_HostNowNs()) deadline = xbox_HostNowNs() + period;
         }
+#if defined(_WIN32)
+        if (poll_timer) CloseHandle(poll_timer);
+#endif
     }
 
     /* Stop the motors before the devices go. */
@@ -806,12 +935,24 @@ int xbox_HostInputStart(const InputHostConfig *cfg)
     static int cs_ready;
     int i;
     if (H.running) return H.found;
+    {
+        const char *setting = getenv("RECOMP_INPUT_POLL_MS");
+        input_poll_ms = setting && !strcmp(setting, "1") ? 1 :
+            setting && !strcmp(setting, "2") ? 2 : g_consumed_edges ? 1 : POLL_MS;
+    }
     if (!cs_ready) { InitializeCriticalSection(&H.cs); cs_ready = 1; }
     EnterCriticalSection(&H.cs);
     memset(H.dev, 0, sizeof(H.dev));
     memset(H.slot, 0, sizeof(H.slot));
     memset(H.out, 0, sizeof(H.out));
     memset(H.last, 0, sizeof(H.last));
+    memset(H.reported, 0, sizeof(H.reported));
+    for (i = 0; i < SLOTS; i++) {
+        uint64_t generation=H.edges[i].generation+1;
+        memset(&H.edges[i],0,sizeof H.edges[i]);
+        H.edges[i].analog_threshold = g_edge_threshold;
+        H.edges[i].generation = generation;
+    }
     memset(H.packet, 0, sizeof(H.packet));
     memset(H.key, 0, sizeof(H.key));
     memset(H.script_held, 0, sizeof(H.script_held));
@@ -852,9 +993,21 @@ void xbox_HostInputConfigure(const InputHostConfig *cfg)
     /* The layout fixed at start stays. */
     {
         int kb = H.cfg.keyboard, players = H.cfg.players;
+        int reset = g_consumed_edges && (H.cfg.ignore_focus != cfg->ignore_focus ||
+            memcmp(&H.cfg.padmap,&cfg->padmap,sizeof cfg->padmap) ||
+            memcmp(&H.cfg.keys,&cfg->keys,sizeof cfg->keys));
         H.cfg = *cfg;
         H.cfg.keyboard = kb;
         H.cfg.players = players;
+        if (reset) {
+            static const unsigned char neutral[10] = {0};
+            int slot;
+            H.input_epoch++;
+            for (slot = 0; slot < SLOTS; slot++) {
+                input_edges_reset(&H.edges[slot],neutral);
+                memset(&H.out[slot],0,sizeof H.out[slot]);
+            }
+        }
     }
     LeaveCriticalSection(&H.cs);
 }
@@ -890,10 +1043,18 @@ void xbox_HostInputScriptVirtual(int slot, const uint8_t *held)
     if (H.slot[slot].device >= 0) joy = H.dev[H.slot[slot].device].vjoy;
     LeaveCriticalSection(&H.cs);
     if (!joy) return;
+    if (xbox_InputTraceActive()) {
+        static uint8_t previous[SLOTS][INPUT_CONTROL_COUNT];
+        if (memcmp(previous[slot], held, INPUT_CONTROL_COUNT)) {
+            memcpy(previous[slot], held, INPUT_CONTROL_COUNT);
+            xbox_InputTraceEmit("script_virtual", slot, held, INPUT_CONTROL_COUNT, 0, 0);
+        }
+    }
     for (c = 0; c < 16; c++)
         if (buttons[c] >= 0) SDL_SetJoystickVirtualButton(joy, buttons[c], held[c] != 0);
-    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, held[INPUT_LEFT_TRIGGER] ? 32767 : 0);
-    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, held[INPUT_RIGHT_TRIGGER] ? 32767 : 0);
+    /* Virtual joystick trigger axes span -32768..32767 before gamepad mapping. */
+    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, held[INPUT_LEFT_TRIGGER] ? 32767 : -32768);
+    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, held[INPUT_RIGHT_TRIGGER] ? 32767 : -32768);
     /* SDL's Y axes point down. */
     v = (held[INPUT_LSTICK_RIGHT] ? 32767 : 0) - (held[INPUT_LSTICK_LEFT] ? 32767 : 0);
     SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_LEFTX, (Sint16)v);
@@ -911,6 +1072,13 @@ void xbox_HostInputScriptVirtual(int slot, const uint8_t *held)
 void xbox_HostInputSetUiActive(int active)
 {
     InterlockedExchange(&H.ui_active, active ? 1 : 0);
+    if (active && H.running && g_consumed_edges) {
+        int s;
+        for (s = 0; s < SLOTS; s++) xbox_HostInputCancelEdges(s);
+    }
+    if (H.running && g_consumed_edges) {
+        EnterCriticalSection(&H.cs); H.input_epoch++; LeaveCriticalSection(&H.cs);
+    }
 }
 
 void xbox_HostInputRumbleTest(int slot)
@@ -957,19 +1125,129 @@ void xbox_HostInputWheel(int notches)
 
 void xbox_HostInputFocus(int focused)
 {
+    xbox_InputTraceEmit("focus", -1, NULL, 0, focused != 0, 0);
     InterlockedExchange(&H.focused, focused ? 1 : 0);
     if (!focused) memset(H.key, 0, sizeof(H.key));
+    if (!focused && H.running && g_consumed_edges) {
+        int s, cancel;
+        EnterCriticalSection(&H.cs);
+        cancel = !H.cfg.ignore_focus;
+        LeaveCriticalSection(&H.cs);
+        if (cancel) for (s = 0; s < SLOTS; s++) xbox_HostInputCancelEdges(s);
+    }
+    if (H.running && g_consumed_edges) {
+        EnterCriticalSection(&H.cs);
+        if (!H.cfg.ignore_focus) H.input_epoch++;
+        LeaveCriticalSection(&H.cs);
+    }
 }
 
 DWORD xbox_HostInputGetState(int slot, XBOX_INPUT_STATE *state)
+{
+    return xbox_HostInputPeekState(slot, state, NULL);
+}
+
+DWORD xbox_HostInputPeekState(int slot, XBOX_INPUT_STATE *state, uint64_t *token)
+{
+    int present;
+    if (token) *token = 0;
+    if (!H.running || slot < 0 || slot >= SLOTS || !state) return ERROR_DEVICE_NOT_CONNECTED;
+    EnterCriticalSection(&H.cs);
+    present = H.slot[slot].device >= 0 || slot == H.kb_slot || (H.kb_merge && slot == 0);
+    if (present) {
+        XBOX_GAMEPAD value = H.out[slot];
+        if (g_consumed_edges) {
+            InputEdges *q = &H.edges[slot];
+            if (InterlockedCompareExchange(&H.ui_active,0,0) ||
+                (!InterlockedCompareExchange(&H.focused,0,0) && !H.cfg.ignore_focus)) {
+                memset(&value,0,sizeof value);
+                input_edges_reset(q,(const unsigned char *)&value);
+            }
+            uint64_t old_expired = q->expired;
+            uint64_t offered = input_edges_peek(q, (unsigned char *)&value, xbox_HostNowNs());
+            if (q->expired != old_expired)
+                xbox_InputTraceEmit("input_edge_loss", slot, NULL, 0, q->overflow, q->expired);
+            if (token) *token = offered;
+            if (memcmp(&value, &H.reported[slot], sizeof value)) {
+                H.reported[slot] = value;
+                H.packet[slot]++;
+            }
+        }
+        to_state(&value, state, H.packet[slot]);
+    }
+    LeaveCriticalSection(&H.cs);
+    return present ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+}
+
+DWORD xbox_HostInputCurrentState(int slot, XBOX_INPUT_STATE *state)
 {
     int present;
     if (!H.running || slot < 0 || slot >= SLOTS || !state) return ERROR_DEVICE_NOT_CONNECTED;
     EnterCriticalSection(&H.cs);
     present = H.slot[slot].device >= 0 || slot == H.kb_slot || (H.kb_merge && slot == 0);
-    if (present) to_state(&H.out[slot], state, H.packet[slot]);
+    if (present) {
+        XBOX_GAMEPAD value = H.out[slot];
+        if (InterlockedCompareExchange(&H.ui_active,0,0) ||
+            (!InterlockedCompareExchange(&H.focused,0,0) && !H.cfg.ignore_focus)) memset(&value,0,sizeof value);
+        to_state(&value,state,H.packet[slot]);
+    }
     LeaveCriticalSection(&H.cs);
     return present ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+}
+
+void xbox_HostInputReportDelivered(int slot, uint64_t token)
+{
+    if (!xbox_HostInputConsumedEdges() || slot < 0 || slot >= SLOTS || !token) return;
+    EnterCriticalSection(&H.cs);
+    input_edges_delivered(&H.edges[slot], token);
+    xbox_InputTraceEmit("input_edge_delivered", slot, NULL, 0, token, H.edges[slot].count);
+    LeaveCriticalSection(&H.cs);
+}
+
+uint64_t xbox_HostInputEdgeGeneration(int slot)
+{
+    uint64_t generation;
+    if (!xbox_HostInputConsumedEdges() || slot < 0 || slot >= SLOTS) return 0;
+    EnterCriticalSection(&H.cs);
+    generation=H.edges[slot].generation;
+    LeaveCriticalSection(&H.cs);
+    return generation;
+}
+
+void xbox_HostInputConsumeGeneration(int slot, uint32_t packet, const void *gamepad,
+    unsigned bytes, uint64_t generation)
+{
+    uint64_t token, expired;
+    if (!xbox_HostInputConsumedEdges() || slot < 0 || slot >= SLOTS || !gamepad || bytes != 18) return;
+    EnterCriticalSection(&H.cs);
+    if (generation && generation != H.edges[slot].generation) {
+        xbox_InputTraceEmit("input_ack_stale_generation",slot,NULL,0,generation,H.edges[slot].generation);
+        LeaveCriticalSection(&H.cs);
+        return;
+    }
+    expired = H.edges[slot].expired;
+    token = input_edges_consume(&H.edges[slot], packet, gamepad, xbox_HostNowNs());
+    if (expired != H.edges[slot].expired)
+        xbox_InputTraceEmit("input_edge_loss", slot, NULL, 0, H.edges[slot].overflow, H.edges[slot].expired);
+    if (token) xbox_InputTraceEmit("input_edge_consumed", slot, gamepad, bytes, token, packet);
+    LeaveCriticalSection(&H.cs);
+}
+
+void xbox_HostInputConsumePacket(int slot, uint32_t packet, const void *gamepad, unsigned bytes)
+{
+    xbox_HostInputConsumeGeneration(slot,packet,gamepad,bytes,0);
+}
+
+void xbox_HostInputCancelEdges(int slot)
+{
+    static const unsigned char neutral[10] = {0};
+    if (!xbox_HostInputConsumedEdges() || slot < 0 || slot >= SLOTS) return;
+    EnterCriticalSection(&H.cs);
+    input_edges_reset(&H.edges[slot], neutral);
+    H.input_epoch++;
+    memset(&H.out[slot], 0, sizeof H.out[slot]);
+    xbox_InputTraceEmit("input_edge_cancel", slot, NULL, 0, H.edges[slot].cancelled, 0);
+    LeaveCriticalSection(&H.cs);
 }
 
 DWORD xbox_HostInputRumble(int slot, WORD low, WORD high)

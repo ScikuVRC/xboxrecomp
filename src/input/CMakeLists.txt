@@ -6,6 +6,7 @@
 add_library(xbox_input STATIC
     xinput_device.c
     keyboard.c          # the key table and the one key map (every host)
+    input_edges.c
 )
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

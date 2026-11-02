@@ -37,6 +37,11 @@ recomp_func_t recomp_lookup(uint32_t xbox_va) { (void)xbox_va; return NULL; }
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NULL; }
 
+#if !defined(_WIN32)
+#include <strings.h>
+#define _stricmp strcasecmp
+#endif
+
 #if defined(_WIN32)
 #define SEP "\\"
 #else
@@ -326,6 +331,50 @@ static void test_save_dir_root(void)
     }
 }
 
+/* A project's game-file redirect (a mod's rebuilt archive): it sees the path
+ * below the game root as the title wrote it, a TRUE answer is the host path,
+ * and paths in the save area never reach it. */
+static char g_redirect_seen[256];
+static int g_redirect_calls;
+
+static BOOL redirect(const char *relative, xbox_host_char *out, DWORD size)
+{
+    char target[700];
+    g_redirect_calls++;
+    snprintf(g_redirect_seen, sizeof g_redirect_seen, "%s", relative);
+    if (_stricmp(relative, "assets\\misc.viv") != 0)
+        return FALSE;
+    snprintf(target, sizeof target, "%s" SEP "overlay" SEP "misc.viv", g_root);
+#if defined(_WIN32)
+    return MultiByteToWideChar(CP_UTF8, 0, target, -1, out, (int)size) != 0;
+#else
+    snprintf(out, size, "%s", target);
+    return TRUE;
+#endif
+}
+
+static void test_game_file_redirect(void)
+{
+    char want[1200];
+
+    printf("game-file redirect\n");
+    set_env("RECOMP_SAVE_DIR", NULL);
+    xbox_path_init(g_game, g_save);
+    g_xbox_game_file_redirect = redirect;
+
+    snprintf(want, sizeof want, "%s" SEP "overlay" SEP "misc.viv", g_root);
+    expect("D:\\ASSETS\\MISC.VIV", want, "a redirected file opens the project's copy");
+    check(strcmp(g_redirect_seen, "ASSETS\\MISC.VIV") == 0, "the redirect sees the title's spelling below the root");
+    expect("\\Device\\CdRom0\\assets\\misc.viv", want, "the same file through the disc device");
+    snprintf(want, sizeof want, "%s" SEP "assets" SEP "other.viv", g_game);
+    expect("D:\\assets\\other.viv", want, "a file it declines stays in the game dir");
+    g_redirect_calls = 0;
+    host("\\Device\\Harddisk0\\Partition1\\UDATA\\4541005b\\SaveMeta.xbx");
+    host("U:\\4541005b");
+    check(g_redirect_calls == 0, "save-area paths never reach it");
+    g_xbox_game_file_redirect = NULL;
+}
+
 int main(int argc, char **argv)
 {
     /* argv[1]: write the report there (Proton drops a console exe's stdout) */
@@ -356,6 +405,7 @@ int main(int argc, char **argv)
     test_default_root();
     test_save_dir_root();
     test_legacy_saves();
+    test_game_file_redirect();
     remove_root();
 
     printf("%s (%d failure%s)\n", failures ? "FAILED" : "OK", failures, failures == 1 ? "" : "s");

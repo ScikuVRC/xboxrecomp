@@ -978,6 +978,22 @@ static void dispatch_unlock(void)
     LeaveCriticalSection(&g_dispatch_cs);
 }
 
+/* Opportunistic callers must not park a game update behind a device DPC.
+ * Hold the existing exclusion recursively around an API that raises IRQL;
+ * acquiring this scope itself neither raises IRQL nor drains guest DPCs. */
+int xbox_DispatchExclusionTryEnter(void)
+{
+    if (xbox_DispatchGateOn()) return xbox_DispatchGateTryEnter();
+    InitOnceExecuteOnce(&g_dispatch_once, dispatch_init, NULL, NULL);
+    return TryEnterCriticalSection(&g_dispatch_cs) != 0;
+}
+
+void xbox_DispatchExclusionLeave(void)
+{
+    if (xbox_DispatchGateOn()) xbox_DispatchGateLeave();
+    else dispatch_unlock();
+}
+
 /* For a DPC runner: wait for any thread at DISPATCH_LEVEL to lower, but not
  * for ever -- an unbalanced raise would otherwise stop every DPC in the
  * title. Returns 1 if the lock was taken (release with

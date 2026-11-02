@@ -21,7 +21,8 @@
 /* A project may set this to watch every guest path the kernel translates (for
  * example to print who opened a file). NULL by default. */
 void (*g_xbox_path_hook)(const char *xbox_path) = NULL;
-BOOL (*g_xbox_game_file_hook)(const char *relative, xbox_host_char *host_path, DWORD size) = NULL;
+/* A project may serve some game-volume files from elsewhere (kernel.h). */
+BOOL (*g_xbox_game_file_redirect)(const char *relative, xbox_host_char *host_path, DWORD size) = NULL;
 
 /*
  * Helper: check if an ANSI string starts with a prefix (case-insensitive).
@@ -664,8 +665,9 @@ translate:
     xbox_AnchorNoteOpen(xbox_path);
     xbox_KernelTrail(8);
     fflush(stderr);
-    if (base_dir == s_game_dir && g_xbox_game_file_hook
-        && g_xbox_game_file_hook(remainder, host_path_buf, buf_size)) {
+    if (g_xbox_game_file_redirect && base_dir == s_game_dir && !sub_dir && remainder[0] &&
+        g_xbox_game_file_redirect(remainder, host_path_buf, buf_size)) {
+        XBOX_TRACE(XBOX_LOG_PATH, "%s -> %S (redirected)", xbox_path, host_path_buf);
         xbox_remember_host_path(host_path_buf);
         return TRUE;
     }
@@ -1037,9 +1039,11 @@ translate:
     fprintf(stderr, "  [PATH] %s\n", xbox_path);
     xbox_AnchorNoteOpen(xbox_path);
     fflush(stderr);
-    if (base_dir == s_game_dir && g_xbox_game_file_hook
-        && g_xbox_game_file_hook(remainder, host_path_buf, buf_size))
+    if (g_xbox_game_file_redirect && base_dir == s_game_dir && !sub_dir && remainder[0] &&
+        g_xbox_game_file_redirect(remainder, host_path_buf, buf_size)) {
+        XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s (redirected)", xbox_path, host_path_buf);
         return TRUE;
+    }
     {
         char remainder_posix[MAX_PATH];
         snprintf(remainder_posix, sizeof(remainder_posix), "%s", remainder);

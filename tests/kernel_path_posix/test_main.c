@@ -13,13 +13,16 @@
  *   2. a file that does not exist yet keeps the title's spelling, inside the
  *      directory that does (so a save is created where the title will look);
  *   3. nothing above the mapped root is rewritten -- the player's folders are
- *      theirs, and two that differ only in case must stay distinct.
+ *      theirs, and two that differ only in case must stay distinct;
+ *   4. a project's game-file redirect sees the path below the game root and
+ *      can serve it from elsewhere; save-area paths never reach it.
  */
 #include "kernel.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -54,6 +57,21 @@ static int same_target(const char *got, const char *want)
     if (stat(wd, &b) != 0)
         return strcmp(gd, wd) == 0;
     return stat(gd, &a) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+}
+
+static char redirect_target[512];
+static char redirect_seen[256];
+static int redirect_calls;
+
+/* Serves D:\assets\misc.viv (any case) from redirect_target. */
+static BOOL redirect(const char *relative, char *host_path, DWORD size)
+{
+    redirect_calls++;
+    snprintf(redirect_seen, sizeof redirect_seen, "%s", relative);
+    if (strcasecmp(relative, "assets\\misc.viv") != 0)
+        return FALSE;
+    snprintf(host_path, size, "%s", redirect_target);
+    return TRUE;
 }
 
 static void touch(const char *path)
@@ -134,6 +152,25 @@ int main(void)
     }
     snprintf(want, sizeof want, "%s/UserData/45410049/ABC", save);
     expect("U:\\45410049\\ABC", want);
+
+    /* 4. The redirect: a listed file goes elsewhere, others and saves do not. */
+    snprintf(redirect_target, sizeof redirect_target, "%s/overlay/misc.viv", root);
+    g_xbox_game_file_redirect = redirect;
+    expect("D:\\ASSETS\\MISC.VIV", redirect_target);
+    if (strcmp(redirect_seen, "ASSETS\\MISC.VIV") != 0) {
+        printf("FAIL: redirect saw '%s', want the title's own spelling below the root\n", redirect_seen);
+        failures++;
+    }
+    snprintf(want, sizeof want, "%s/gconfig.xml", game);
+    expect("D:\\gconfig.xml", want);
+    redirect_calls = 0;
+    snprintf(want, sizeof want, "%s/UserData/45410049/ABC", save);
+    expect("U:\\45410049\\ABC", want);
+    if (redirect_calls) {
+        printf("FAIL: a save-area path reached the game-file redirect\n");
+        failures++;
+    }
+    g_xbox_game_file_redirect = NULL;
 
     {
         char cmd[700];

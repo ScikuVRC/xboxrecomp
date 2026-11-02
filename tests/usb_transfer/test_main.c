@@ -2,10 +2,32 @@
 #undef NDEBUG
 #define xbox_GetMappedSize usb_test_mapped_size
 #define xbox_GetMemoryOffset usb_test_memory_offset
+#define usb_gamepad_report_peek usb_test_report_peek
+#define usb_gamepad_report_delivered usb_test_report_delivered
 #include "../../src/usb/ohci.c"
 #undef xbox_GetMappedSize
 #undef xbox_GetMemoryOffset
+#undef usb_gamepad_report_peek
+#undef usb_gamepad_report_delivered
 #include <assert.h>
+#include "input_host.h"
+#ifdef XBOXRECOMP_HAVE_SDL3
+#include <SDL3/SDL.h>
+#endif
+extern int usb_gamepad_report_peek(int pad,uint8_t *out,int max,uint64_t *token);
+extern void usb_gamepad_report_delivered(int pad,uint64_t token);
+static int fake_report, delivered_count, delivered_pad;
+static uint64_t delivered_token;
+int usb_test_report_peek(int pad,uint8_t *out,int max,uint64_t *token)
+{
+    if (!fake_report) return usb_gamepad_report_peek(pad,out,max,token);
+    assert(max>=20);memset(out,0,20);out[1]=20;out[6]=255;*token=0xABCu;return 20;
+}
+void usb_test_report_delivered(int pad,uint64_t token)
+{
+    if (!fake_report) { usb_gamepad_report_delivered(pad,token);return; }
+    delivered_count++;delivered_pad=pad;delivered_token=token;
+}
 extern ptrdiff_t g_xbox_mem_offset;
 size_t usb_test_mapped_size(void) { return 16u*1024u*1024u; }
 recomp_func_t recomp_lookup(uint32_t address) { (void)address; abort(); }
@@ -28,8 +50,67 @@ static void address_pad(int pad,unsigned address)
     assert(usb_gamepad_control(pad,&packet,NULL,0)==0);
     packet.bRequest=9;packet.wValue=1;assert(usb_gamepad_control(pad,&packet,NULL,0)==0);
 }
-int main(void)
+static int test_script_axes(int virt)
 {
+    /* Fixed script for the process: the sampler may read it concurrently.
+     * Distinct indexed diagonals cover all signs, slots and both sticks. */
+    static const int16_t expected[4][4] = {
+        {32767,32767,32767,32767}, {-32767,-32767,-32767,-32767},
+        {-32767,32767,32767,-32767}, {32767,-32767,-32767,32767}
+    };
+    InputHostConfig cfg;
+    _putenv_s("RECOMP_PAD_HOST",virt?"1":"0");
+    _putenv_s("RECOMP_PAD_MIN_HOLD_MS","0");
+    _putenv_s("RECOMP_PAD_SCRIPT_FORMAT","seconds");
+    _putenv_s("RECOMP_PAD_SCRIPT_VIRTUAL",virt?"1":"");
+    _putenv_s("RECOMP_PAD_SCRIPT",
+        "lright:0:9999,lup:0:9999,rright:0:9999,rup:0:9999,"
+        "p2-lleft:0:9999,p2-ldown:0:9999,p2-rleft:0:9999,p2-rdown:0:9999,"
+        "p3-lleft:0:9999,p3-lup:0:9999,p3-rright:0:9999,p3-rdown:0:9999,"
+        "p4-lright:0:9999,p4-ldown:0:9999,p4-rleft:0:9999,p4-rup:0:9999");
+    if (virt) {
+#ifdef XBOXRECOMP_HAVE_SDL3
+        assert(SDL_Init(SDL_INIT_GAMEPAD));
+        xbox_HostInputDefaults(&cfg);
+        cfg.no_pads=1;cfg.virtual_pads=4;cfg.keyboard=INPUT_HOST_KEYBOARD_OFF;
+        cfg.rumble_on_connect=0;cfg.ignore_focus=1;
+        cfg.padmap.deadzone_left=cfg.padmap.deadzone_right=0;
+        assert(xbox_HostInputStart(&cfg)==4);
+#else
+        abort();
+#endif
+    }
+    for (int pad=0;pad<4;pad++) {
+        uint8_t report[20];
+        DWORD deadline=GetTickCount()+1000;
+        int matched=0;
+        do {
+            assert(usb_gamepad_report(pad,report,20)==20);
+            matched=1;
+            for (int axis=0;axis<4;axis++) {
+                int16_t value;
+                memcpy(&value,report+12+axis*2,2);
+                if (virt) {
+                    /* Radial mapping limits a full diagonal to the unit circle. */
+                    if ((expected[pad][axis]>0 && value<20000) ||
+                        (expected[pad][axis]<0 && value>-20000)) matched=0;
+                } else if (value!=expected[pad][axis]) matched=0;
+            }
+            if (!matched) Sleep(1);
+        } while (!matched && (int32_t)(deadline-GetTickCount())>0);
+        assert(matched);
+        for (int byte=2;byte<12;byte++) assert(report[byte]==0);
+    }
+    puts(virt?"PASS seconds-script stick axes through SDL/host/USB, all four slots":
+              "PASS seconds-script stick axes in USB reports, all four slots");
+    /* Process exit owns the USB sampler; do not tear down its host first. */
+    return 0;
+}
+
+int main(int argc,char **argv)
+{
+    if (argc==2 && !strcmp(argv[1],"--script-axes")) return test_script_axes(0);
+    if (argc==2 && !strcmp(argv[1],"--script-axes-virtual")) return test_script_axes(1);
     memory=VirtualAlloc(NULL,16u*1024u*1024u,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);assert(memory);
     g_xbox_mem_offset=(ptrdiff_t)memory;
     for(unsigned va=0x1000;va<0x10000;va+=4096) xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)va);
@@ -72,7 +153,24 @@ int main(void)
     assert(rd32(0x1084)==done);ohci_write(&s_hc[0],HcInterruptStatus,INTR_WDH,4);
     assert(rd32(0x1084)==0&&!(s_hc[0].reg[HcInterruptStatus/4]&INTR_WDH));
     ohci_raise(&s_hc[0],INTR_WDH);assert(!(s_hc[0].reg[HcInterruptStatus/4]&INTR_WDH));
-    puts("PASS hub/four-pad caches, split descriptors, rumble, DMA errors, indexed scripts/reset and shared done queue");
+    /* Exercise the actual OHCI delivery branch with one retained report.
+     * Invalid DMA may not commit; a retry may commit; an unchanged periodic
+     * report NAK may not commit again. Queue retirement is a later guest ACK. */
+    fake_report=1;s_report_sent[0]=0;done=0;
+    wr32(0x6400,10|(1u<<7));wr32(0x6404,0x6440);wr32(0x6408,0x6420);wr32(0x640C,0);
+    td_at(0x6420,TD_DP_IN,0xFFFFFFF0u,8,0x6440);
+    assert(ohci_run_list(&s_hc[0],0x6400,1,&done)==1);
+    assert((rd32(0x6420)>>28)==12 && !delivered_count && !s_report_sent[0]);
+    wr32(0x6408,0x6420);td_at(0x6420,TD_DP_IN,0,0,0x6440);done=0;
+    assert(ohci_run_list(&s_hc[0],0x6400,1,&done)==1 && !delivered_count && !s_report_sent[0]);
+    wr32(0x6408,0x6420);td_at(0x6420,TD_DP_IN,0x9000,8,0x6440);done=0;
+    assert(ohci_run_list(&s_hc[0],0x6400,1,&done)==1 && !delivered_count && !s_report_sent[0]);
+    wr32(0x6408,0x6420);td_at(0x6420,TD_DP_IN,0x9000,20,0x6440);done=0;
+    assert(ohci_run_list(&s_hc[0],0x6400,1,&done)==1);
+    assert(delivered_count==1 && delivered_pad==0 && delivered_token==0xABCu && s_report_sent[0]);
+    wr32(0x6408,0x6420);td_at(0x6420,TD_DP_IN,0x9000,20,0x6440);done=0;
+    assert(ohci_run_list(&s_hc[0],0x6400,1,&done)==0 && delivered_count==1);
+    puts("PASS hub/four-pad caches, split descriptors, rumble, DMA errors, indexed scripts/reset, shared done queue and retained-token commit/retry/NAK");
     /* Process exit owns the test sampler; do not free its shared memory first. */
     return 0;
 }

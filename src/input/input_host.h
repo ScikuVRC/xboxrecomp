@@ -128,6 +128,24 @@ int xbox_HostInputRawPad(int slot, InputRaw *raw);
  * the slot. While the window is unfocused a device reads as at rest. */
 DWORD xbox_HostInputGetState(int slot, XBOX_INPUT_STATE *state);
 
+/* Optional guest-consumed transitions. Enable before Start; default off.
+ * The application must acknowledge successful guest reads of an 18-byte Xbox
+ * gamepad body. USB commit tokens are advanced only after successful transfers.
+ * Without that integration leave disabled. Every queue is bounded by 64 edges
+ * and 100ms; cancellation/overflow/expiry resynchronize to current input. */
+void xbox_HostInputEnableConsumedEdges(int enabled);
+void xbox_HostInputSetEdgeThreshold(unsigned threshold); /* before Start, 0..255 */
+int xbox_HostInputConsumedEdges(void);
+DWORD xbox_HostInputPeekState(int slot, XBOX_INPUT_STATE *state, uint64_t *token);
+DWORD xbox_HostInputCurrentState(int slot, XBOX_INPUT_STATE *state); /* snapshot, never advances edges */
+void xbox_HostInputReportDelivered(int slot, uint64_t token);
+void xbox_HostInputConsumePacket(int slot, uint32_t packet, const void *gamepad, unsigned bytes);
+/* A delayed title ACK must belong to the queue that supplied its read. */
+uint64_t xbox_HostInputEdgeGeneration(int slot);
+void xbox_HostInputConsumeGeneration(int slot, uint32_t packet, const void *gamepad,
+    unsigned bytes, uint64_t generation);
+void xbox_HostInputCancelEdges(int slot);
+
 /* Vibrate the pad in `slot` (0 stops it). Quietly succeeds with no pad. */
 DWORD xbox_HostInputRumble(int slot, WORD low, WORD high);
 

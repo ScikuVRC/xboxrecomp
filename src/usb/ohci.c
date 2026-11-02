@@ -12,6 +12,7 @@
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
 #include "usb_hub.h"
+#include "../input/input_trace.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -543,6 +544,7 @@ static int usb_dev_control(int dev, const UsbSetup *setup, uint8_t *out, int max
 }
 static uint8_t s_int_buf[32];
 static int s_int_len;
+static int s_int_moved;
 
 
 /* Every address below came out of guest memory, so none of them are trusted.
@@ -652,6 +654,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     uint32_t endpoint = (ed0 >> 7) & 0xFu;
     int      moved = 0;
     int      dev = usb_route(ed0 & 0x7Fu);
+    s_int_moved = 0;
 
     if (dev > 0 && s_reset_seen[dev - 1] != usb_gamepad_reset_generation(dev - 1))
         usb_reset_device(dev);
@@ -745,6 +748,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             if (n > 0)
                 memcpy(guest_ptr(cbp, (uint32_t)n), s_int_buf, (size_t)n);
             moved = n;
+            s_int_moved = n;
         }
     } else {
         /* OUT: the status stage of an IN control transfer, or rumble. Both
@@ -920,6 +924,7 @@ static int ohci_run_list(OhciController *hc, uint32_t head_pa, int periodic,
             uint32_t next = rd32(td + 8) & ED_PTR_MASK;
             uint32_t cc;
             int report_pad = -1;
+            uint64_t input_token = 0;
 
             /* An interrupt IN endpoint with nothing new: NAK, which leaves the
              * descriptor where it is for the next poll. The hub has something
@@ -937,7 +942,7 @@ static int ohci_run_list(OhciController *hc, uint32_t head_pa, int periodic,
                     s_int_len = n;
                 } else if (dev >= USB_DEV_PAD(0)) {
                     int pad = dev - 1;
-                    int n = usb_gamepad_report(pad, s_int_buf, (int)sizeof s_int_buf);
+                    int n = usb_gamepad_report_peek(pad, s_int_buf, (int)sizeof s_int_buf, &input_token);
                     s_pad_polls[pad]++;
                     if (periodic && s_report_sent[pad] && n > 0 && !memcmp(s_int_buf, s_last_report[pad], (size_t)n))
                         break;
@@ -967,7 +972,9 @@ static int ohci_run_list(OhciController *hc, uint32_t head_pa, int periodic,
                 }
             }
             cc = ohci_do_td(hc, ed0, td);
-            if (cc == TD_CC_NOERROR && report_pad >= 0 && s_int_len > 0) {
+            if (cc == TD_CC_NOERROR && report_pad >= 0 && s_int_len > 0 && s_int_moved == s_int_len) {
+                usb_gamepad_report_delivered(report_pad, input_token);
+                xbox_InputTraceEmit("usb_complete", report_pad, s_int_buf, (unsigned)s_int_len, td, 0);
                 memcpy(s_last_report[report_pad], s_int_buf, (size_t)s_int_len);
                 s_report_sent[report_pad] = 1;
             }

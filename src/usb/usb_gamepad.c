@@ -20,6 +20,9 @@
 #include <ctype.h>
 #include "../input/xinput_xbox.h"
 #include "../input/input_host.h"
+#include "../input/input_trace.h"
+
+static int snapshot_report(int pad, uint8_t *out, int max);
 
 /* ---- descriptors ------------------------------------------------------- */
 
@@ -158,7 +161,8 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
         && setup->bRequest == 0x01u                    /* GET_REPORT */
         && is_in) {
         uint8_t report[20];
-        int n = usb_gamepad_report(pad, report, (int)sizeof report);
+        int n = xbox_HostInputConsumedEdges() ? snapshot_report(pad, report, (int)sizeof report)
+                                             : usb_gamepad_report(pad, report, (int)sizeof report);
         if (n <= 0)
             return -1;
         return copy_out(out, max, report, n, setup->wLength);
@@ -697,25 +701,39 @@ static void apply_script(int pad, uint8_t *out);   /* below */
  *    at least one of those reads. A button pressed is reported pressed for at
  *    least RECOMP_PAD_MIN_HOLD_MS (120 by default), however quickly it is let
  *    go; 0 turns this off. */
-static void sample_now(int pad, uint8_t *out);       /* below */
+static void sample_now(int pad, uint8_t *out, uint64_t *token, int snapshot); /* below */
 
 static CRITICAL_SECTION s_latch_cs;
 static uint8_t s_latch[USB_GAMEPAD_MAX][20];                 /* presses seen since the last report */
 static INIT_ONCE s_sampler_once = INIT_ONCE_STATIC_INIT;
 static CRITICAL_SECTION s_sample_cs;
 
+/* Called under s_sample_cs; observe changes without changing the sampler. */
+static void trace_sample(int pad, const uint8_t *state)
+{
+    static uint8_t previous[USB_GAMEPAD_MAX][20];
+    if (xbox_InputTraceActive() && memcmp(previous[pad], state, 20)) {
+        memcpy(previous[pad], state, 20);
+        xbox_InputTraceEmit("usb_sample", pad, state, 20, 0, 0);
+    }
+}
+
 static DWORD WINAPI sampler_thread(LPVOID unused)
 {
     (void)unused;
     for (;;) {
         int pad, i;
+        xbox_InputTraceEmit("sampler_tick", -1, NULL, 0, 4, 0);
         for (pad = 0; pad < USB_GAMEPAD_MAX; pad++) {
             uint8_t cur[20];
             EnterCriticalSection(&s_sample_cs);
-            sample_now(pad, cur);
+            sample_now(pad, cur, NULL, 0);
+            trace_sample(pad, cur);
             LeaveCriticalSection(&s_sample_cs);
+            if (xbox_HostInputConsumedEdges()) continue;
             EnterCriticalSection(&s_latch_cs);
             s_latch[pad][2] |= cur[2];
+            s_latch[pad][3] |= cur[3];
             for (i = 4; i < 12; i++)
                 if (cur[i] > s_latch[pad][i]) s_latch[pad][i] = cur[i];
             LeaveCriticalSection(&s_latch_cs);
@@ -744,6 +762,7 @@ static void merge_latch(int pad, uint8_t *out)
     int i;
     EnterCriticalSection(&s_latch_cs);
     out[2] |= s_latch[pad][2];
+    out[3] |= s_latch[pad][3];
     for (i = 4; i < 12; i++)
         if (s_latch[pad][i] > out[i]) out[i] = s_latch[pad][i];
     memset(s_latch[pad], 0, sizeof s_latch[pad]);
@@ -792,23 +811,51 @@ static void min_hold(int pad, uint8_t *out)
 
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
+    return usb_gamepad_report_peek(pad, out, max, NULL);
+}
+
+int usb_gamepad_report_peek(int pad, uint8_t *out, int max, uint64_t *token)
+{
+    int consumed;
+    if (token) *token = 0;
     if (pad < 0 || pad >= USB_GAMEPAD_MAX || max < 20) return 0;
     InitOnceExecuteOnce(&s_sampler_once, start_sampler, NULL, NULL);
     EnterCriticalSection(&s_sample_cs);
-    sample_now(pad, out);
-    merge_latch(pad, out);
-    min_hold(pad, out);
+    sample_now(pad, out, token, 0);
+    trace_sample(pad, out);
+    consumed = xbox_HostInputConsumedEdges();
+    if (!consumed) merge_latch(pad, out);
+    xbox_InputTraceEmit("usb_latched", pad, out, 20, consumed, 0);
+    if (!consumed) min_hold(pad, out);
+    xbox_InputTraceEmit("usb_built", pad, out, 20, consumed, token ? *token : 0);
     LeaveCriticalSection(&s_sample_cs);
     return 20;
 }
 
+void usb_gamepad_report_delivered(int pad, uint64_t token)
+{
+    xbox_HostInputReportDelivered(pad, token);
+}
+
 /* The pad as it is this instant: the host's pad, plus the pad script. */
-static void sample_now(int pad, uint8_t *out)
+static int snapshot_report(int pad, uint8_t *out, int max)
+{
+    if (pad < 0 || pad >= USB_GAMEPAD_MAX || max < 20) return 0;
+    InitOnceExecuteOnce(&s_sampler_once,start_sampler,NULL,NULL);
+    EnterCriticalSection(&s_sample_cs);
+    sample_now(pad,out,NULL,1);
+    xbox_InputTraceEmit("usb_control_snapshot",pad,out,20,0,0);
+    LeaveCriticalSection(&s_sample_cs);
+    return 20;
+}
+
+static void sample_now(int pad, uint8_t *out, uint64_t *token, int snapshot)
 {
     XBOX_INPUT_STATE state;
     const XBOX_GAMEPAD *g;
     uint8_t synth = pad == 0 ? synthetic_buttons() : 0;
     int i;
+    if (token) *token = 0;
 
     memset(out, 0, 20);
     out[0] = 0;
@@ -850,12 +897,22 @@ static void sample_now(int pad, uint8_t *out)
             fflush(stderr);
         }
     }
-    if (xbox_InputGetState((DWORD)pad, &state) != 0) {
+    if ((xbox_HostInputConsumedEdges()
+        ? (snapshot ? xbox_HostInputCurrentState(pad,&state) : xbox_HostInputPeekState(pad, &state, token))
+        : xbox_InputGetState((DWORD)pad, &state)) != 0) {
         apply_script(pad, out);
         return;
     }
 
     g = &state.Gamepad;
+    if (xbox_InputTraceActive() && !snapshot) {
+        static DWORD packet[USB_GAMEPAD_MAX];
+        static int seen[USB_GAMEPAD_MAX];
+        if (!seen[pad] || packet[pad] != state.dwPacketNumber) {
+            seen[pad] = 1; packet[pad] = state.dwPacketNumber;
+            xbox_InputTraceEmit("usb_host_read", pad, g, sizeof *g, state.dwPacketNumber, 0);
+        }
+    }
     out[2] = (uint8_t)((g->wButtons & 0xFF) | synth);
     out[3] = (uint8_t)((g->wButtons >> 8) & 0xFF);
     for (i = 0; i < 8; i++)
@@ -882,7 +939,8 @@ extern double xbox_FileOpenSeconds(const char *spec);
  *     RECOMP_PAD_SCRIPT=start:150:151,a:160:160.5
  *
  * Names: up down left right start back ls rs (digital, byte 2) and a b x y
- * black white lt rt (analog, full press). Added to the host pad's state.
+ * black white lt rt (analog, full press), and lleft/lright/lup/ldown plus
+ * rleft/rright/rup/rdown (stick full throw). Added to the host pad's state.
  *
  * "@file#N" switches the entries after it to seconds since that file's Nth
  * open (xbox_FileOpenSeconds), for screens that arrive after a variable wait,
@@ -892,11 +950,16 @@ extern double xbox_FileOpenSeconds(const char *spec);
  *     RECOMP_PAD_SCRIPT=start:14:14.3,a:20:20.3,a:24:24.3,@main.mus#1,right:3:3.3 */
 static void apply_script(int pad, uint8_t *out)
 {
-    static const struct { const char *name; int byte; uint8_t bit; } names[] = {
+    static const struct { const char *name; int byte; uint8_t bit; int16_t axis; } names[] = {
         { "up", 2, 0x01 }, { "down", 2, 0x02 }, { "left", 2, 0x04 }, { "right", 2, 0x08 },
         { "start", 2, 0x10 }, { "back", 2, 0x20 }, { "ls", 2, 0x40 }, { "rs", 2, 0x80 },
         { "a", 4, 0 }, { "b", 5, 0 }, { "x", 6, 0 }, { "y", 7, 0 },
         { "black", 8, 0 }, { "white", 9, 0 }, { "lt", 10, 0 }, { "rt", 11, 0 },
+        /* Keep INPUT_CONTROL_COUNT order for the host/virtual held array. */
+        { "lup", 14, 0, 32767 }, { "ldown", 14, 0, -32767 },
+        { "lleft", 12, 0, -32767 }, { "lright", 12, 0, 32767 },
+        { "rup", 18, 0, 32767 }, { "rdown", 18, 0, -32767 },
+        { "rleft", 16, 0, -32767 }, { "rright", 16, 0, 32767 },
     };
     const char *s = getenv("RECOMP_PAD_SCRIPT");
     double t;
@@ -980,20 +1043,23 @@ static void apply_script(int pad, uint8_t *out)
             if (phase > hold)
                 continue;
         }
-        if (idx < sizeof logged[pad] && !logged[pad][idx]) {
-            logged[pad][idx] = 1;
-            fprintf(stderr, "  [PAD] script: %s sampled at %.2f s (span %.2f..%.2f)\n",
-                    name, t, from, to);
-        }
         for (i = 0; i < sizeof names / sizeof names[0]; i++) {
             if (strcmp(names[i].name, name))
                 continue;
+            if (idx < sizeof logged[pad] && !logged[pad][idx]) {
+                logged[pad][idx] = 1;
+                fprintf(stderr, "  [PAD] script: %s sampled at %.2f s (span %.2f..%.2f)\n",
+                        name, t, from, to);
+            }
             if (as_keys)
                 held[i] = 1;                    /* the table is in control order */
+            else if (names[i].axis)
+                memcpy(out + names[i].byte, &names[i].axis, sizeof names[i].axis);
             else if (names[i].bit)
                 out[names[i].byte] |= names[i].bit;
             else
                 out[names[i].byte] = 0xFF;
+            break;
         }
     }
     if (as_keys) script_hold(pad, held);
@@ -1005,4 +1071,5 @@ void usb_gamepad_reset(int pad)
     if (pad < 0 || pad >= USB_GAMEPAD_MAX) return;
     s_address[pad] = s_configuration[pad] = 0;
     ++s_reset_generation[pad];
+    xbox_HostInputCancelEdges(pad);
 }

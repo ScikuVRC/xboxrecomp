@@ -10,6 +10,38 @@ extern ptrdiff_t g_xbox_mem_offset;
 void *recomp_lookup(ULONG address) { (void)address; abort(); }
 void *recomp_lookup_manual(ULONG address) { (void)address; abort(); }
 static uint8_t *memory;
+static HANDLE scope_ready,scope_release;
+static DWORD WINAPI hold_scope(void *unused) {
+    (void)unused;
+    if(!xbox_DispatchExclusionTryEnter()) return 1;
+    SetEvent(scope_ready);WaitForSingleObject(scope_release,2000);
+    xbox_DispatchExclusionLeave();return 0;
+}
+static int test_optional_scope(void) {
+    HANDLE thread;
+    DWORD result=1;
+    int failed=0;
+    scope_ready=CreateEvent(NULL,FALSE,FALSE,NULL);
+    scope_release=CreateEvent(NULL,FALSE,FALSE,NULL);
+    thread=CreateThread(NULL,0,hold_scope,NULL,0,NULL);
+    if(!scope_ready || !scope_release || !thread || WaitForSingleObject(scope_ready,2000)!=WAIT_OBJECT_0) return 1;
+    ULONGLONG start=GetTickCount64();
+    if(xbox_DispatchExclusionTryEnter()) { failed=1;xbox_DispatchExclusionLeave(); }
+    if(GetTickCount64()-start>50 || xbox_IrqlCurrent()!=0) failed=1;
+    SetEvent(scope_release);WaitForSingleObject(thread,2000);GetExitCodeThread(thread,&result);
+    failed|=(result!=0);
+    if(!xbox_DispatchExclusionTryEnter()) failed=1;
+    else {
+        if(!xbox_DispatchExclusionTryEnter()) failed=1;
+        else xbox_DispatchExclusionLeave();
+        if(xbox_IrqlCurrent()!=0) failed=1;
+        KIRQL old=xbox_KfRaiseIrql(2);xbox_KfLowerIrql(old);
+        if(old!=0 || xbox_IrqlCurrent()!=0) failed=1;
+        xbox_DispatchExclusionLeave();
+    }
+    CloseHandle(thread);CloseHandle(scope_ready);CloseHandle(scope_release);
+    return failed;
+}
 static int call_irql(unsigned ordinal, uint32_t ecx, unsigned expected_old, unsigned expected_level) {
     uint32_t *stack=(uint32_t *)(memory+0x20000);
     stack[0]=0x12345678; stack[1]=0xA5A5A507;
@@ -40,6 +72,7 @@ int main(void) {
     failed|=call_irql(160,0x12340003,2,3);
     failed|=call_irql(161,0xFACE0002,0,2);
     failed|=call_irql(161,0xABCD0000,0,0);
+    failed|=test_optional_scope();
     VirtualFree(memory,0,MEM_RELEASE);
     if(!failed) puts("PASS fastcall IRQL: CL arguments, old levels, nesting and stack canary");
     return failed;

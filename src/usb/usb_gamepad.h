@@ -42,6 +42,9 @@ void usb_gamepad_out(int pad, const uint8_t *data, int len);
 
 /* Fill in pad `pad`'s 20-byte input report. Returns the byte count written. */
 int usb_gamepad_report(int pad, uint8_t *out, int max);
+/* OHCI peeks with a token, and commits it only on a successful transfer. */
+int usb_gamepad_report_peek(int pad, uint8_t *out, int max, uint64_t *token);
+void usb_gamepad_report_delivered(int pad, uint64_t token);
 
 /* The address the host assigned pad `pad` with SET_ADDRESS, 0 until it does,
  * and whether it has been configured. */
