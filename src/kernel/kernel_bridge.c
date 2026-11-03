@@ -732,9 +732,10 @@ void guest_cpu_part(void);
  * Logical CPU 2 when the process may use it: clear of CPU 0, where Windows
  * does much of its own work, and on the hybrid parts this was measured on the
  * low numbers are the performance cores. RECOMP_GUEST_CORES=all turns it off. */
-void xbox_PinToGuestCore(void)
-{
 #if defined(_WIN32)
+/* That core as a mask, 0 when the threads are spread. */
+DWORD_PTR xbox_GuestCoreMask(void)
+{
     static DWORD_PTR mask;
     static volatile LONG init;
 
@@ -753,6 +754,15 @@ void xbox_PinToGuestCore(void)
     }
     while (init != 2)
         YieldProcessor();
+    return mask;
+}
+#endif
+
+void xbox_PinToGuestCore(void)
+{
+#if defined(_WIN32)
+    DWORD_PTR mask = xbox_GuestCoreMask();
+
     if (mask)
         SetThreadAffinityMask(GetCurrentThread(), mask);
 #elif defined(__linux__)
@@ -4343,12 +4353,20 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
      * that core early in start-up (a 1 ms wait returned 3,125 ms later); the
      * USB host controller's first deferred routine waited with it, the
      * driver gave up on the pad and the title sat at "press start" for good.
-     * When the guest core is unavailable to it, the title's own threads, which
-     * are pinned there, cannot run either, so it still does not run beside
-     * them in practice. RECOMP_TIMER_PIN=1 pins it as before. */
+     * The title thread can be what holds it: Windows raised the main thread,
+     * spinning in Direct3D's wait for ring space, to priority 21, and the
+     * timer thread pinned behind it never ran the deferred routine the spin
+     * was waiting for (a white window at start-up, in 1 two-game start of 5).
+     * Off the core it runs beside that spin, which is all the spin needs.
+     * The core is RECOMP_GUEST_CPUS's when that is set (xbox_GuestThreadPin
+     * applies it last), else the one xbox_PinToGuestCore uses; reading only
+     * the first, this was off unless RECOMP_GUEST_CPUS was set.
+     * RECOMP_TIMER_PIN=1 pins it as before. */
 #if defined(_WIN32)
     {
         DWORD_PTR guest = xbox_GuestCpuMask();
+        if (!guest)
+            guest = xbox_GuestCoreMask();
         if (guest && !getenv("RECOMP_TIMER_PIN")) {
             DWORD core = 0;
             while (!((guest >> core) & 1))

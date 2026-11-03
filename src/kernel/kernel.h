@@ -886,6 +886,10 @@ ULONGLONG xbox_GuestUptimeMs(void);
  * the console's titles all share its one CPU (kernel_bridge.c). Call it at
  * the start of every thread that runs guest code. */
 void xbox_PinToGuestCore(void);
+#if defined(_WIN32)
+/* That CPU as a mask, 0 when RECOMP_GUEST_CORES=all spreads them. */
+DWORD_PTR xbox_GuestCoreMask(void);
+#endif
 NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(ULONG Count, PVOID Objects[], ULONG WaitType, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
 
 BOOLEAN  __stdcall xbox_KeCancelTimer(PXBOX_KTIMER Timer);
