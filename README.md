@@ -643,7 +643,7 @@ merged. [@apexJCL](https://github.com/apexJCL) tested
 [@koenhendriks](https://github.com/koenhendriks)'s SSX 3 PRs on Burnout 3 and
 BLiNX 2 and found three things. A DVD region had landed in MiscFlags. With
 vsync off the present spun a core at 8,500 loops a second. A clipped vertex
-could come out with w ≤ 0. [@vyanhursky](https://github.com/vyanhursky)'s
+could come out with w ≤ 0. A player's
 Def Jam test notes found an interrupt snapshot that dropped* `g_eflags`*. A
 Darkwatch bring-up sent a measured report, a patch and a watchdog dump. Even
 the test oracle needed checking: the new x87 trig model matches the Xbox's
@@ -748,7 +748,7 @@ below was looked at twice.*
 
   They're built on #191's key table, and `RECOMP_KEYBOARD` is the first
   adopter, byte for byte the same as v0.14.0 —
-  *[@vyanhursky](https://github.com/vyanhursky)* (#203)
+  a Def Jam fork (#203)
 - **Four root-hub ports, and the first pad on controller port 1.** The pad
   used to arrive as player 3, so a title that reads only slot 0 saw no
   controller. `RECOMP_USB_PORT=0` / `RECOMP_USB_NDP=2` bring back the old
@@ -871,14 +871,14 @@ were found on other people's machines.*
   *[@NoRain211](https://github.com/NoRain211)* (#183)
 - **COMISD/UCOMISD read the float lane**, so 1.0 and 2.0 as doubles could
   compare equal —
-  *[@vyanhursky](https://github.com/vyanhursky)* (#178)
+  a Def Jam fork (#178)
 - **Parity `setcc`/`cmovcc` readers**, including the `pe`/`po` spellings, read
   their bit after a known flag producer —
-  *[@vyanhursky](https://github.com/vyanhursky)* (#180)
+  a Def Jam fork (#180)
 - **FPREM/FPREM1 report completion**: C2 is clear after a full reduction, so
   a CRT `fmod` loop that polls it terminates. Also covered by #183's
   `recomp_fprem`; its two conformance cases are kept —
-  *[@vyanhursky](https://github.com/vyanhursky)* (#177)
+  a Def Jam fork (#177)
 - **`in`/`out` lift to runtime port I/O.** They were `RECOMP_UNIMPL`, so `in al, dx`
   left AL unchanged. The video encoder's field pin at 0x80C0, which D3D's vblank
   ISR polls, is modelled; every other port reads 0 and logs once. Takes effect
@@ -924,8 +924,7 @@ were found on other people's machines.*
   *[@apexJCL](https://github.com/apexJCL)* (#189)
 - **A failed fixed view on Darwin leaked its placeholder**, and every later view
   at that address was refused —
-  *[@apexJCL](https://github.com/apexJCL)* (#185), tested on a Def Jam port by
-  *[@vyanhursky](https://github.com/vyanhursky)*
+  *[@apexJCL](https://github.com/apexJCL)* (#185), tested on a Def Jam port
 - **`tests/proton_run.sh`** runs mingw-built Windows tests under Proton as
   ctest's emulator —
   *[@apexJCL](https://github.com/apexJCL)* (#187)
@@ -939,13 +938,13 @@ were found on other people's machines.*
   - `NtFreeVirtualMemory` answers in guest terms;
   - a missing game file is reported once by name (`RECOMP_MISSING_FILES`);
   - POSIX `NtClose` drops a handle's directory search, which
-    *[@vyanhursky](https://github.com/vyanhursky)* also found (#201).
+    a Def Jam fork also found (#201).
 
   *[@apexJCL](https://github.com/apexJCL)* (#190)
 - **Guest-built events in multiple-object waits.** A KEVENT the title built by
   writing its header now resolves in `KeWaitForMultipleObjects`, as it already
   did for a single wait —
-  *[@vyanhursky](https://github.com/vyanhursky)* (#181)
+  a Def Jam fork (#181)
 - **The APU.** Physical addresses above 64 MB were folded into the low 64 MB.
   Voices are resampled by pitch: 44.1 kHz material had played 8.8% fast. The
   trapped front end takes one trap at a time, output is paced by the device,
@@ -998,11 +997,11 @@ were found on other people's machines.*
 - **The C fixtures run under MSVC**: 25 tests that skipped on a
   Visual Studio-only machine now execute, and a missing compiler is a real
   skip instead of a silent pass —
-  *[@vyanhursky](https://github.com/vyanhursky)* (#179)
+  a Def Jam fork (#179)
 - **A standalone POSIX directory-search fixture**: 300 abandoned searches,
   live searches running side by side, restart, and mixed closes. #190 carries
   the same fix —
-  *[@vyanhursky](https://github.com/vyanhursky)* (#201)
+  a Def Jam fork (#201)
 
 **Maintenance**
 
@@ -1103,21 +1102,21 @@ happens; each surfaces later, somewhere else.*
 
 - **`pushad`/`popad` were TODOs**, so a routine that saved every register
   with them returned with its caller's registers clobbered —
-  *[@vyanhursky](https://github.com/vyanhursky)* (#167)
+  a Def Jam fork (#167)
 - **A failed indirect call to a caller-cleans function popped its arguments
   twice**: the failure path rewound over them, then the caller's
   `add esp, N` did too —
-  *[@vyanhursky](https://github.com/vyanhursky)* (#169)
+  a Def Jam fork (#169)
 - **`rep movs` touching the hardware aperture used host `memcpy`**, whose
   vector loads skip the element-sized accesses trapped device memory needs —
-  *[@vyanhursky](https://github.com/vyanhursky)* (#170)
+  a Def Jam fork (#170)
 - **Two kinds of join read a flag nothing assigns**: swapped-operand float
   compares, and a result snapshot meeting a compare snapshot. Each edge now
   computes the join's condition itself —
   *[@BearddOddity](https://github.com/BearddOddity)* (#159)
 - **Manual entry hooks**: a `sub_XXXXXXXX_enter()` in the manual file runs at
   the top of the generated function on every call, direct ones included —
-  *[@vyanhursky](https://github.com/vyanhursky)* (#168)
+  a Def Jam fork (#168)
 
 **Contributed: kernel**
 
@@ -1133,7 +1132,7 @@ happens; each surfaces later, somewhere else.*
   *[@BearddOddity](https://github.com/BearddOddity)* (#160)
 - **Closing a directory mid-search leaked the host search**, and a reused
   handle value continued the old cursor —
-  *[@vyanhursky](https://github.com/vyanhursky)* (#171)
+  a Def Jam fork (#171)
 - **Kernel small fixes**: NT pseudo-handles sign-extended on x64 (the CRT had
   retried `NtDuplicateObject` forever), `STATUS_CONFLICTING_ADDRESSES` → 487 so
   the CRT heap grows elsewhere, a 64-bit kernel call counter that no longer

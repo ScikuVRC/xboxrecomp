@@ -785,7 +785,7 @@ DirectSound and USB stack. Developed with Claude Code.
   Making the walk opt-in came from its own Burnout 3 run, which found D3D's
   fence wait sleeping on an interrupt the runtime never raises.
 
-### Vlad Yanhursky — [@vyanhursky](https://github.com/vyanhursky)
+### From a *Def Jam* bring-up fork
 Five fixes extracted from a *Def Jam* bring-up fork, each with a fixture that
 fails on the old code and a real-CPU conformance case where one applies.
 

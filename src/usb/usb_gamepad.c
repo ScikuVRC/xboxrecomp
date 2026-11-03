@@ -683,7 +683,7 @@ static void pad_script_apply(int pad, uint8_t *out)
 
 static void apply_script(int pad, uint8_t *out);   /* below */
 
-/* Quick presses could be lost: START and A needed two presses (Vlad, with a
+/* Quick presses could be lost: START and A needed two presses (found with a
  * real pad). Two exposures, two guards below.
  *
  * 1. The pad was only sampled when the controller model asked it for a
