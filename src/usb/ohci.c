@@ -612,9 +612,20 @@ extern uint32_t xbox_PhysicalToVirtual(uint32_t pa);
 
 static uint32_t phys_to_guest(uint32_t pa)
 {
-    uint32_t va = xbox_PhysicalToVirtual(pa);
+    uint32_t va = xbox_PhysicalToVirtual(pa), alias;
     if (va)
         return va;
+    /* A heap page's physical name is its alias in the first RAM mirror
+     * (xbox_PhysRamName: va + the RAM size). The record answers only for pages
+     * the title named, and a buffer named by its first page runs on into the
+     * next: undo the alias for those, rather than putting them in the window,
+     * where an alias lands past its end and the transfer reads zeros and drops
+     * its writes. Found while chasing a start-up hang whose main cause was the
+     * timer thread's core (kernel_timer_thread, kernel_bridge.c). */
+    alias = xbox_PhysRamAlias();
+    if (alias && pa >= alias && pa - alias >= XBOX_HEAP_BASE && pa - alias < XBOX_HEAP_TOP &&
+        pa - alias < XBOX_CONTIG_SIZE)
+        return pa - alias;
     return (pa >= XBOX_CONTIG_BASE) ? pa : XBOX_CONTIG_BASE + pa;
 }
 
