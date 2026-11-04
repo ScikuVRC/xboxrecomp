@@ -763,8 +763,8 @@ void xbox_PinToGuestCore(void)
 #if defined(_WIN32)
     DWORD_PTR mask = xbox_GuestCoreMask();
 
-    if (mask)
-        SetThreadAffinityMask(GetCurrentThread(), mask);
+    if (mask && SetThreadAffinityMask(GetCurrentThread(), mask))
+        xbox_StarveWatchAdd(mask);
 #elif defined(__linux__)
     /* The same rule through the scheduler: every guest thread on one CPU the
      * process is allowed to use, CPU 2 when it is one of them. */

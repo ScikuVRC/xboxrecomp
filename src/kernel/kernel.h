@@ -889,6 +889,9 @@ void xbox_PinToGuestCore(void);
 #if defined(_WIN32)
 /* That CPU as a mask, 0 when RECOMP_GUEST_CORES=all spreads them. */
 DWORD_PTR xbox_GuestCoreMask(void);
+/* Watch the calling thread, pinned to `mask`: let it run elsewhere if it
+ * starves there (kernel_starve.c). */
+void xbox_StarveWatchAdd(DWORD_PTR mask);
 #endif
 NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(ULONG Count, PVOID Objects[], ULONG WaitType, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
 

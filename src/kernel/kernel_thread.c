@@ -520,6 +520,9 @@ void xbox_GuestThreadPin(const char *role)
         }
         return;
     }
+#if defined(_WIN32)
+    xbox_StarveWatchAdd(mask);
+#endif
     if (!announced) {
         announced = 1;
         fprintf(stderr, "  [KERNEL] guest threads on one host core (cpu %d),"

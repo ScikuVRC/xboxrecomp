@@ -16,6 +16,7 @@ set(KERNEL_SOURCES
     kernel_sync.c
     kernel_hal.c
     kernel_guest_cpu.c
+    kernel_starve.c
     kernel_xbox.c
     kernel_ob.c
     kernel_io.c
