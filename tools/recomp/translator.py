@@ -441,7 +441,7 @@ def load_label_db(labels_json_path):
 _BACK_EDGE_GOTO_RE = re.compile(r"goto loc_([0-9A-Fa-f]{8});")
 
 
-def _mark_back_edges(bb, stmts):
+def _mark_back_edges(bb, stmts, macro="RECOMP_BACK_EDGE"):
     """The block's statements with every jump back to the block's start or
     earlier -- a loop's back edge -- calling RECOMP_BACK_EDGE first, the guest
     CPU's quantum check (templates/runtime/recomp_types.h): with the lock on,
@@ -456,7 +456,7 @@ def _mark_back_edges(bb, stmts):
         target = int(m.group(1), 16)
         if target > bb.start:
             return m.group(0)
-        return "{ RECOMP_BACK_EDGE(0x%08Xu); goto loc_%08X; }" % (va, target)
+        return "{ %s(0x%08Xu); goto loc_%08X; }" % (macro, va, target)
 
     out = None
     for i, stmt in enumerate(stmts):
@@ -528,6 +528,12 @@ class FunctionTranslator:
         # The guest CPU's quantum check at every loop back edge
         # (RECOMP_BACK_EDGE), with --back-edge-yield; off, edges stay bare.
         self.back_edge_yield = False
+        # Functions whose loops yield the host CPU now and then
+        # (RECOMP_SPIN_YIELD, --spin-yield): a title's busy-wait that a host
+        # thread priority boost would otherwise let starve the threads it
+        # waits for on the same core.
+        self.spin_yield = set()
+        self._current_function = None
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover callbacks and the gap entries their bodies reference."""
@@ -2599,6 +2605,7 @@ class FunctionTranslator:
         Returns a string of C source code, or None on failure.
         """
         start = func_addr
+        self._current_function = func_addr
         recovered = self._recovered_cfg.get(start)
         end = recovered["end"] if recovered else func_info.get("end")
         if not end:
@@ -3082,6 +3089,8 @@ class FunctionTranslator:
 
             if self.back_edge_yield:
                 stmts = _mark_back_edges(bb, stmts)
+            elif self._current_function in self.spin_yield:
+                stmts = _mark_back_edges(bb, stmts, "RECOMP_SPIN_YIELD")
 
             first = len(lines)
             for stmt in stmts:
@@ -3226,12 +3235,13 @@ class BatchTranslator:
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
                  icall_sites_json_path=None, back_edge_yield=False,
-                 entry_stubs=False):
+                 entry_stubs=False, spin_yield=None):
         """back_edge_yield: RECOMP_BACK_EDGE at every loop back edge
         (--back-edge-yield; off by default). entry_stubs: an unresolved
         target inside a function enters a copy of it (--entry-stubs)."""
         self.xbe_path = xbe_path
         self.back_edge_yield = back_edge_yield
+        self.spin_yield = set(spin_yield or ())
         self.entry_stubs = entry_stubs
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
@@ -3293,6 +3303,7 @@ class BatchTranslator:
             trace_functions=trace_functions,
             force_returns=force_returns, icall_sites=self.icall_sites)
         self.translator.back_edge_yield = self.back_edge_yield
+        self.translator.spin_yield = self.spin_yield
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
         for explicit_helper in (seh_prolog, seh_epilog):

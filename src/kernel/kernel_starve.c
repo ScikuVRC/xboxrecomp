@@ -25,6 +25,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <sched.h>
+#endif
 
 #if defined(_WIN32)
 
@@ -201,3 +204,28 @@ void xbox_StarveWatchAdd(DWORD_PTR mask)
 void xbox_StarveWatchAdd(DWORD_PTR mask) { (void)mask; }
 
 #endif
+
+/* RECOMP_SPIN_YIELD (a loop back edge in a function lifted with --spin-yield): a title's
+ * busy-wait, such as Def Jam's Direct3D waiting for push-buffer space, gives the core to
+ * whatever else is ready on it every SPIN_EVERY passes. Windows had raised the waiting
+ * thread to priority 21 and 26, above every thread it waited for, which share its core:
+ * they never ran, and the game stalled loading (the watcher above only lets one out now
+ * and then). SwitchToThread runs a ready thread of any priority on this processor. */
+#define SPIN_EVERY      32
+#if defined(_MSC_VER)
+static __declspec(thread) unsigned s_spins;
+#else
+static _Thread_local unsigned s_spins;
+#endif
+
+void xbox_GuestSpinYield(uint32_t va)
+{
+    (void)va;
+    if (++s_spins % SPIN_EVERY)
+        return;
+#if defined(_WIN32)
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
+}

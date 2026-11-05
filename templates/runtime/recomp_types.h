@@ -1198,6 +1198,9 @@ void xbox_GuestCpuPreempt(uint32_t va);
 #define RECOMP_BACK_EDGE(va) \
     do { if (RECOMP_LOAD_RELAXED32(&g_xbox_guest_cpu_preempt)) \
              xbox_GuestCpuPreempt(va); } while (0)
+/* A loop back edge in a function lifted with --spin-yield (kernel_starve.c). */
+void xbox_GuestSpinYield(uint32_t va);
+#define RECOMP_SPIN_YIELD(va) xbox_GuestSpinYield(va)
 
 /**
  * RECOMP_ICALL - Indirect call through the dispatch table.

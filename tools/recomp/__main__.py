@@ -284,6 +284,12 @@ def main():
                              "a loop that makes no kernel call; it costs a "
                              "load and a branch per edge when the lock is "
                              "off. Off by default: edges stay bare")
+    parser.add_argument("--spin-yield", metavar="ADDR", action="append", default=[],
+                        help="A function (hex address, repeatable) whose loops "
+                             "call RECOMP_SPIN_YIELD at their back edges: the "
+                             "runtime lets other threads on the core run now "
+                             "and then, so a busy-wait the host boosted cannot "
+                             "starve the thread it waits for")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -363,6 +369,7 @@ def main():
             "icall_sites.json"),
         back_edge_yield=args.back_edge_yield,
         entry_stubs=args.entry_stubs,
+        spin_yield=[int(a, 16) for a in args.spin_yield],
     )
 
     t_load = time.time() - t0

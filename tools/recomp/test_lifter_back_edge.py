@@ -83,3 +83,24 @@ def test_a_switch_arm_going_backward_is_a_back_edge():
     # Every jump back to the arm yields, and only those: the Def Jam fork's
     # proven-slot fallback is a second way to the same arm.
     assert code.count("RECOMP_BACK_EDGE") == code.count("goto loc_00010000;"), code
+
+
+def _translate_spin(hexcode, spin):
+    """--spin-yield <function>: only that function's back edges yield."""
+    image = bytes.fromhex(hexcode)
+    config._install(
+        [config.Section(".text", BASE, len(image), 0, len(image), True)],
+        entry_point=BASE, kernel_thunk_addr=BASE, origin="spin-yield-test")
+    db = {BASE: {"start": f"0x{BASE:08X}", "end": BASE + len(image),
+                 "_addr": BASE, "size": len(image)}}
+    t = FunctionTranslator(image, db)
+    t.spin_yield = set(spin)
+    return t.translate_function(BASE, db[BASE])
+
+
+def test_spin_yield_marks_only_the_named_functions_loops():
+    code = _translate_spin(COUNT_DOWN, {BASE})
+    assert ("{ RECOMP_SPIN_YIELD(0x%08Xu); goto loc_%08X; }" % (BASE + 1, BASE)) in code, code
+    assert "RECOMP_BACK_EDGE" not in code
+    assert "RECOMP_SPIN_YIELD" not in _translate_spin(COUNT_DOWN, {BASE + 0x100})
+    assert "RECOMP_SPIN_YIELD" not in _translate_spin(FORWARD, {BASE})
