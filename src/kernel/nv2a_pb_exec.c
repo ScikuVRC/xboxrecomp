@@ -631,6 +631,7 @@ void xbox_Nv2aSetFlipHz(int hz) { InterlockedExchange(&s_flip_hz_override, hz > 
  * 0.5 ms of sleep had no headroom: the executor, not the 60 Hz timer, set its
  * length, and the title's clock (which follows flips) slowed with it. */
 static int s_et_on = -1;
+static LONGLONG s_et_tex;     /* texture binding and state inside the batch */
 static LONGLONG s_et_freq, s_et_batch, s_et_gather, s_et_draw, s_et_last_flip, s_et_run, s_et_run_t0;
 static unsigned s_et_batches, s_et_gverts, s_et_words[4];
 /* Around each nv2a_pb_run, from the GPU thread's loop: the executor's own time.
@@ -688,6 +689,7 @@ static void exec_timing_frame(LONGLONG flip_at, LONGLONG sleep, LONGLONG present
         s_et_run_t0 = flip_at;
     static unsigned n, saturated;
     static LONGLONG window;
+    static double tex_sum;          /* texture binding, summed over the window */
     double ms = 1000.0 / (double)s_et_freq;
     if (s_et_last_flip && n < ET_MAX) {
         double interval = (double)(flip_at - s_et_last_flip) * ms;
@@ -703,6 +705,7 @@ static void exec_timing_frame(LONGLONG flip_at, LONGLONG sleep, LONGLONG present
         f_nb[n] = (float)s_et_batches;
         f_gv[n] = (float)s_et_gverts;
         f_wait[n] = (float)(interval - (double)run_in * ms);
+        tex_sum += (double)s_et_tex * ms;
         {
             unsigned k;
             for (k = 0; k < 4; k++)
@@ -713,7 +716,7 @@ static void exec_timing_frame(LONGLONG flip_at, LONGLONG sleep, LONGLONG present
         n++;
     }
     s_et_last_flip = flip_at;
-    s_et_batch = s_et_gather = s_et_draw = 0;
+    s_et_batch = s_et_gather = s_et_draw = s_et_tex = 0;
     s_et_batches = s_et_gverts = 0;
     memset(s_et_words, 0, sizeof s_et_words);
     if (!window)
@@ -737,9 +740,11 @@ static void exec_timing_frame(LONGLONG flip_at, LONGLONG sleep, LONGLONG present
                     med[8], med[9], 10);
             et_sort(f_wait, n);
             fprintf(stderr, "[EXECTIME] waiting for the title %.2f/%.2f/%.2f ms (median/p95/max); words a frame: "
-                            "%.0f transform constants, %.0f transform program, %.0f vertex/index, %.0f other%c",
+                            "%.0f transform constants, %.0f transform program, %.0f vertex/index, %.0f other; "
+                            "texture binding %.2f ms a frame%c",
                     f_wait[n / 2], f_wait[(n * 95) / 100], f_wait[n - 1],
-                    words[0] / n, words[1] / n, words[2] / n, words[3] / n, 10);
+                    words[0] / n, words[1] / n, words[2] / n, words[3] / n, tex_sum / n, 10);
+            tex_sum = 0;
         }
         memset(words, 0, sizeof words);
         n = saturated = 0;
@@ -4735,6 +4740,7 @@ static void draw_primitive_body(void)
                  * drawing it. The address is already resolved through the DMA
                  * object, so what goes across is a host pointer the translator
                  * can copy from. */
+                LONGLONG et_t0 = s_et_on > 0 ? et_now() : 0;
                 bind_extra_stages(gpu);
                 /* Host vertices and its supersampled canvas use logical pixels.
                  * s_gpu.clip_* includes console AA (2x1/2x2) for the software
@@ -4750,6 +4756,8 @@ static void draw_primitive_body(void)
                 } else {
                     pgraph_d3d11_set_texture_ready(0, NULL, 0, 0, 0);
                 }
+                if (et_t0)
+                    s_et_tex += et_now() - et_t0;
                 /* RECOMP_PB_BATCH_DUMP=<flip>: one line per batch of that
                  * frame -- what it samples and the extent of what it sends.
                  * The verbose print shows the first six batches of the run,

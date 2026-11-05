@@ -593,16 +593,24 @@ static PackEntry *lookup(const char *id)
     while(a<b) { size_t mid=a+(b-a)/2; if(strcmp(g_entries[mid].id,id)<=0) a=mid+1; else b=mid; }
     return a && !strcmp(g_entries[a-1].id,id) ? &g_entries[a-1] : NULL;
 }
+static uint32_t mix32(uint32_t x)
+{
+    x^=x>>16; x*=0x7feb352du; x^=x>>15; x*=0x846ca68bu; x^=x>>16;
+    return x;
+}
+/* The texture and its palette are mixed apart and only then combined. XORed raw, they
+ * cancelled: a palettised texture keeps its palette right after its indices, so the palette's
+ * host address is the texture's guest address plus a constant, and Def Jam's Subway put 24
+ * crowd textures in 6 slots. Four ways each, they evicted one another on every bind, and each
+ * bind hashed the texture in full again: about 700 SHA-256s a second, 20 ms of a 25 ms frame. */
 static unsigned source_slot(const RecompTextureSource *s)
 {
     uintptr_t palette=(uintptr_t)s->palette;
-    uint32_t key=s->address ^ s->format*0x9e3779b9u ^ (uint32_t)palette;
-    /* Guest allocation alignment must not discard all useful address bits. */
+    uint32_t pal=(uint32_t)palette;
 #if UINTPTR_MAX > 0xffffffffu
-    key^=(uint32_t)(palette>>32);
+    pal^=(uint32_t)(palette>>32)*0x9e3779b1u;
 #endif
-    key^=key>>16; key*=0x7feb352du;
-    key^=key>>15; key*=0x846ca68bu; key^=key>>16;
+    uint32_t key=mix32(s->address ^ s->format*0x9e3779b9u) ^ ((mix32(pal)<<13)|(mix32(pal)>>19));
     return key & (SOURCE_SLOTS-1);
 }
 /* ---- Background decoding. ------------------------------------------------------------
@@ -838,7 +846,8 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
         state->interval = state->interval<REVALIDATE_STABLE_MS ? state->interval*2 : REVALIDATE_STABLE_MS;
     } else {
         { ULONGLONG h0=now_ms(); int ok=texture_pack_hash(s,id), ms=(int)(now_ms()-h0);
-          if(ms>=1 && g_trace) fprintf(stderr,"[TEXPACK] hash %ux%u fmt %x: %d ms\n",s->width,s->height,s->format,ms);
+          if(ms>=1 && g_trace) fprintf(stderr,"[TEXPACK] hash %ux%u fmt %x at 0x%08X palette %p (%u): %d ms, %s\n",s->width,s->height,s->format,
+                                       s->address,(const void *)s->palette,s->palette_entries,ms,!state?"new":state->unstable?"unstable":"changed");
           if(!ok) return 0; }
         if(!state) {
             state=&g_sources[slot];
